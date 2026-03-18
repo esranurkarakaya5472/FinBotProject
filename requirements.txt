@@ -10,5 +10,5 @@ reportlab
 fpdf
 pandas
 openpyxl
-google-generativeai
-PyPDF2
+langchain-chroma
+langchain-text-splitters
