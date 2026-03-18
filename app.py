@@ -1,13 +1,20 @@
 import streamlit as st
 import os
-import google.generativeai as genai
-from PyPDF2 import PdfReader
+import tempfile
+from embedding import EmbeddingManager
+from retriever import DocumentRetriever
+from llm_client import LLMClient
 
 # ─────────────────────────────────────────────────────────────────
 # 1. API KONFİGÜRASYONU
 # ─────────────────────────────────────────────────────────────────
-API_KEY = os.getenv("GOOGLE_API_KEY") or "AIzaSyAiQQzd9bVAgnXbRo0V0G_EZ1X1_5AVmbA"
-genai.configure(api_key=API_KEY)
+API_KEY = os.getenv("GOOGLE_API_KEY")
+if not API_KEY:
+    try:
+        API_KEY = st.secrets["GOOGLE_API_KEY"]
+    except:
+        API_KEY = "AIzaSyAiQQzd9bVAgnXbRo0V0G_EZ1X1_5AVmbA"
+os.environ["GOOGLE_API_KEY"] = API_KEY
 
 # Sayfa Ayarları
 st.set_page_config(
@@ -232,19 +239,10 @@ st.markdown("""
 # ─────────────────────────────────────────────────────────────────
 if "messages" not in st.session_state:
     st.session_state.messages = []
-if "pdf_text" not in st.session_state:
-    st.session_state.pdf_text = ""
-
-def extract_text_from_pdf(file):
-    try:
-        reader = PdfReader(file)
-        full_text = ""
-        for page in reader.pages:
-            t = page.extract_text()
-            if t: full_text += t + "\n"
-        return full_text.strip() if full_text.strip() else None, None
-    except Exception as e:
-        return None, str(e)
+if "vector_store" not in st.session_state:
+    st.session_state.vector_store = None
+if "is_ready" not in st.session_state:
+    st.session_state.is_ready = False
 
 # ─────────────────────────────────────────────────────────────────
 # 4. SIDEBAR (GLOWING ELEMENTS)
@@ -253,25 +251,36 @@ with st.sidebar:
     st.markdown('<div class="sidebar-header"><h1>💎 FinBot Pro</h1></div>', unsafe_allow_html=True)
     
     st.markdown("### 📄 Rapor Yükleme")
-    uploaded_file = st.file_uploader("", type=["pdf"])
+    uploaded_file = st.file_uploader("", type=["pdf", "xlsx", "xls"])
     
     if uploaded_file:
-        if not st.session_state.pdf_text:
-            with st.spinner("🔍 FinBot Verileri Analiz Ediyor..."):
-                text, err = extract_text_from_pdf(uploaded_file)
-                if err: st.error(f"⚠️ Hata: {err}")
-                else:
-                    st.session_state.pdf_text = text
+        if not st.session_state.is_ready:
+            with st.spinner("🔍 FinBot Verileri Analiz Ediyor... Lütfen bekleyin"):
+                suffix = ".pdf" if uploaded_file.name.lower().endswith(".pdf") else ".xlsx"
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                    tmp.write(uploaded_file.getvalue())
+                    path = tmp.name
+                
+                try:
+                    em = EmbeddingManager(api_key=API_KEY)
+                    vs = em.create_vector_store(path)
+                    st.session_state.vector_store = vs
+                    st.session_state.is_ready = True
                     st.success("✅ Hazır")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"⚠️ Hata: {str(e)}")
         else:
             st.success("✅ Aktif")
             if st.button("🗑️ Belleği Temizle"):
-                st.session_state.pdf_text = ""
+                st.session_state.vector_store = None
+                st.session_state.is_ready = False
                 st.session_state.messages = []
                 st.rerun()
     else:
-        st.info("💡 PDF dökümanı bekliyor...")
-        st.session_state.pdf_text = ""
+        st.info("💡 PDF veya Excel dökümanı bekliyor...")
+        st.session_state.vector_store = None
+        st.session_state.is_ready = False
 
     st.markdown("---")
     st.caption("v2.9 | Ultra-Vibrant Glow")
@@ -279,7 +288,7 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────────
 # 5. ANA EKRAN VE AKILLI AI AKIŞI
 # ─────────────────────────────────────────────────────────────────
-if not st.session_state.pdf_text:
+if not st.session_state.is_ready:
     st.markdown("""
         <div class="hero-section">
             <div class="hero-card">
@@ -314,40 +323,20 @@ else:
             st.spinner("🔍 FinBot Verileri Analiz Ediyor...")
 
         try:
-            available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-            target_model = None
-            for m_name in available_models:
-                if "gemini-1.5-flash" in m_name:
-                    target_model = m_name
-                    break
-            if not target_model:
-                for m_name in available_models:
-                    if "flash" in m_name:
-                        target_model = m_name
-                        break
-            if not target_model:
-                target_model = available_models[0]
-
-            model = genai.GenerativeModel(target_model)
-            prompt = f"Döküman içeriği: {st.session_state.pdf_text} \n\n Soru: {user_input}"
+            # 4. Yanıtı al
+            retriever_mgr = DocumentRetriever(vector_store=st.session_state.vector_store)
+            retriever = retriever_mgr.get_retriever(user_input)
             
-            # 4. Gemini Streaming başlatılıyor
-            response_stream = model.generate_content(prompt, stream=True)
+            llm_client = LLMClient(api_key=API_KEY)
+            full_response = llm_client.generate_answer(user_input, retriever)
             
-            # 5. Bot balonunu temsil eden placeholder
-            bot_placeholder = st.empty()
-            full_response = ""
-            
-            # Spinner'ı yazı başlayınca temizle
+            # Spinner'ı temizle
             loader_placeholder.empty()
-
-            for chunk in response_stream:
-                full_response += chunk.text
-                # Bot balonunu anlık güncelle
-                bot_placeholder.markdown(f'<div class="message-wrapper bot-wrapper"><div class="msg-bubble bot-msg">{full_response}</div></div>', unsafe_allow_html=True)
+            bot_placeholder = st.empty()
+            bot_placeholder.markdown(f'<div class="message-wrapper bot-wrapper"><div class="msg-bubble bot-msg">{full_response}</div></div>', unsafe_allow_html=True)
             
             # 6. Yanıtı kalıcı hafızaya al ve sayfayı yenile
             st.session_state.messages.append({"role": "assistant", "content": full_response})
-            st.rerun()
+            # (Render edildiği için anında rerun yerine bir sonraki işlemde güncellenir veya istenirse st.rerun() açılabilir)
         except Exception as e:
             st.error(f"❌ Sistem Hatası: {str(e)}")
